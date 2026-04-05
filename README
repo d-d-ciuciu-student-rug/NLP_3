@@ -1,0 +1,8 @@
+#!/bin/bash
+
+# On a Linux machine, with `uv` package manager installed, using Python 3.14.
+#  We worked with an Nvidia GPU of our own.
+
+   OMP_NUM_THREADS=8 \
+&& MKL_NUM_THREADS=8 \
+&& uv run python3 main.py

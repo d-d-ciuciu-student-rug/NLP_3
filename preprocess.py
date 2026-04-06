@@ -32,9 +32,6 @@ def concatenate_title_and_description_into_merged(data: pd.DataFrame,
                           data[description_alias].fillna("")
                          ).str.strip()
 
-    data.drop(columns = [title_alias, description_alias],
-              inplace = True)
-
 
 def align_labels_to_zero_index_and_rename(data: pd.DataFrame,
                                           label_alias: str = "label",

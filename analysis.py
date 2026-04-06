@@ -11,16 +11,16 @@ from preprocess import tokenize, encode
 from tuning import ParameterRange, ParameterSpace
 
 
-def get_misclassified_examples(device: torch.device,
-                               model: Module,
-                               data: pd.DataFrame,
-                               maximum_error_samples: int,
-                               tokenizer_rules: tuple[bool, list[tuple[str, str]]],
-                               padding_token: tuple[str, int],
-                               unknown_token: tuple[str, int],
-                               vocabulary: dict[str, int],
-                               target_input_list_length: int
-                               ) -> list[tuple[int, int, str]]:
+def get_misclassified_examples_CNN_LSTM(device: torch.device,
+                                        model: Module,
+                                        data: pd.DataFrame,
+                                        maximum_error_samples: int,
+                                        tokenizer_rules: tuple[bool, list[tuple[str, str]]],
+                                        padding_token: tuple[str, int],
+                                        unknown_token: tuple[str, int],
+                                        vocabulary: dict[str, int],
+                                        target_input_list_length: int
+                                        ) -> list[tuple[int, int, str]]:
     model.eval()
     errors: list[tuple[int, int, str]] = []
 
@@ -52,6 +52,48 @@ def get_misclassified_examples(device: torch.device,
             snippet: str = text.replace("\n", " ")
             snippet = snippet[:250] + ("..." if len(snippet) > 250 else "")
             errors.append((y, prediction, snippet))
+
+        if len(errors) >= maximum_error_samples:
+            break
+
+    return errors
+
+
+def get_misclassified_examples_transformer(device: torch.device,
+                                           model: Module,
+                                           data: pd.DataFrame,
+                                           maximum_error_samples: int,
+                                           tokenizer: Any,
+                                           max_length: int
+                                           ) -> list[tuple[int, int, str]]:
+    model.eval()
+    errors: list[tuple[int, int, str]] = []
+
+    encoding = tokenizer(
+        data["input"].tolist(),
+        truncation = True,
+        padding = "max_length",
+        max_length = max_length,
+        return_tensors = "pt"
+    )
+
+    input_ids = encoding["input_ids"].to(device)
+    attention_mask = encoding["attention_mask"].to(device)
+
+    labels = torch.tensor(data["output"].values, dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        predictions = torch.argmax(outputs.logits, dim=1)
+
+
+    for true_label, pred_label, text in zip(labels.cpu().numpy(),
+                                            predictions.cpu().numpy(),
+                                            data["input"]):
+        if true_label != pred_label:
+            snippet = text.replace("\n", " ")
+            snippet = snippet[:250] + ("..." if len(snippet) > 250 else "")
+            errors.append((true_label, pred_label, snippet))
 
         if len(errors) >= maximum_error_samples:
             break

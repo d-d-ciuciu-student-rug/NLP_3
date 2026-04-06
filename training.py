@@ -176,7 +176,7 @@ def train_CNN(device, vocabulary,
 
     test_metrics = evaluate(device, model_CNN, initial_test_loader)
     total_time = end_time - start_time
-    print(f"\t\t\tTraining took {total_time} seconds.")
+    print(f"\t\t\tTraining took {total_time:.2f} seconds.")
 
     results_CNN = {
         "history": history,

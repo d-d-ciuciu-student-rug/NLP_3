@@ -1,16 +1,13 @@
-# We had a rather long startup-time. Initially we thought it has to do with needing to minimize the imports.
-#  It turned out to be related to OpenMP and the number of cores on the machine.
-#  To solve the problem we had to set some environment variables `OMP_NUM_THREADS` and `MKL_NUM_THREADS`.
+# uv run python3 main.py
 #
-# This is now incorporated in the `run.sh` script, which calls `python3` through the package manager `uv`,
-#  while also enabling the profiling of the program, to figure out which function calls take up the longest
-#  amount of CPU-time.
+# OR
 #
-# As it stands, this program is actually CPU-bound.
+# ./run.sh
 
 from copy import deepcopy
 import gc
 import math
+import random
 from random import seed as random_seed
 from time import perf_counter
 from typing import Any
@@ -19,7 +16,7 @@ import pandas as pd
 import numpy as np
 from numpy.random import seed as numpy_seed
 
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
 
 import torch
 import torch.nn as nn
@@ -44,7 +41,8 @@ from training import (train_time_and_evaluate,
                       train_CNN,
                       train_LSTM,
                       )
-from analysis import (get_misclassified_examples,
+from analysis import (get_misclassified_examples_CNN_LSTM,
+                      get_misclassified_examples_transformer,
                       get_confusion_matrix,
                       compute_classification_metrics,
                       plot_learning_curves,
@@ -174,7 +172,6 @@ if __name__ == "__main__":
             downloaded = True
             cached_seed = seed
 
-
         print("\nRetrieving pre-processed dataset from cache.")
 
         return (train_df, validate_df, initial_test_df, final_test_df, mapping_120k, mapping_7k)
@@ -184,7 +181,7 @@ if __name__ == "__main__":
                                                            ParameterSpace, ParameterSpace]:
         # Determine how many worker threads the CPU-side can afford.
         num_worker_threads: int = 0
-        print("Using {num_worker_threads} worker threads for PyTorch.")
+        print(f"Using {num_worker_threads} worker threads for PyTorch.")
 
         print("\nDefining the parameter space for the (tokenization and encoding) phase.")
 
@@ -424,26 +421,41 @@ if __name__ == "__main__":
         return (train_loader, validate_loader, initial_test_loader)
 
 
-    def load_best_model(specific_model: tuple[dict[str, Any], dict[str, Any], float],
+    def load_best_model(specific_model: tuple[dict[str, Any], dict[str, Any], float] | dict,
                         model_type: str,
                         device: torch.device
                         ) -> nn.Module:
     
-        state_dict: dict[str, Any] = specific_model[1]
-        init_params: dict[str, Any] = specific_model[2]
-        
         if model_type == "CNNTextClassifier":
-            model: nn.Module = CNNTextClassifier(**init_params)
-        else:
-            model: nn.Module = LSTMTextClassifier(**init_params)
+            state_dict: dict[str, Any] = specific_model["weights"]
+            init_params: dict[str, Any] = specific_model["model"]
         
-        model.load_state_dict(state_dict)
+            model: nn.Module = CNNTextClassifier(**init_params)
+            model.load_state_dict(state_dict)
+
+        elif model_type == "LSTMTextClassifier":
+            state_dict: dict[str, Any] = specific_model["weights"]
+            init_params: dict[str, Any] = specific_model["model"]
+            
+            model: nn.Module = LSTMTextClassifier(**init_params)
+            model.load_state_dict(state_dict)
+
+        elif model_type == "BERTTextClassifier":
+            model = AutoModelForSequenceClassification.from_pretrained(
+                specific_model["bert_parameters"]["initial_model"],
+                num_labels = specific_model["bert_parameters"]["num_classes"]
+            )
+            model.load_state_dict(specific_model["weights"])
+
         model.to(device)
+        model.eval()
         
         return model
 
 
-    def pipeline_train_best_LSTM_and_CNN(seed: int,
+    def pipeline_train_best_LSTM_and_CNN(seed: int, device: torch.device,
+                                         train_df, validate_df, initial_test_df, final_test_df,
+                                         mapping_120k, mapping_7k,
                                          epoch_metrics: dict, model_final_metrics: dict, models_tracker: dict):
         """
             Executes the complete pipeline, from retrieving the data, seeding the PRNGs,
@@ -451,25 +463,14 @@ if __name__ == "__main__":
              evaluating the models and logging some metrics to file (for later visualization).
         """
 
-        device: torch.device = get_device()
-
-        # Setting a reproducible PRNG state.
-        print(f"\nSeeding PRNGs: {seed}.")
+        # Setting a reproducible PRNG state, per pipeline (not just for data-splitting).
+        print(f"\nSeeding PRNGs for the LSTM+CNN pipeline: {seed}.")
         set_seed(seed)
 
         (num_worker_threads,
          TOKENIZATION_ENCODING_PARAMETER_SPACE,
          TRAINING_PARAMETER_SPACE,
          CNN_PARAMETER_SPACE, LSTM_PARAMETER_SPACE) = build_parameter_space_LSTM_and_CNN()
-
-        (train_df,
-         validate_df,
-         initial_test_df,
-         final_test_df,
-         mapping_120k,
-         mapping_7k) = get_preprocessed_dataset(seed)
-
-        inverse_mapping_7k: dict[int, int] = {v: k for k, v in mapping_7k.items()}
 
 
         for tokenization_parameters in TOKENIZATION_ENCODING_PARAMETER_SPACE:
@@ -493,119 +494,188 @@ if __name__ == "__main__":
                  initial_test_loader) = loader_1(training_parameters, num_worker_threads,
                                                  train_td, validate_td, initial_test_td)
 
-                for model_parameters_CNN in CNN_PARAMETER_SPACE:
-                    train_CNN(device, vocabulary,
-                              tokenization_parameters, training_parameters, model_parameters_CNN,
-                              train_loader, validate_loader, initial_test_loader,
-                              epoch_metrics, model_final_metrics, models_tracker)
-
                 for model_parameters_LSTM in LSTM_PARAMETER_SPACE:
                     train_LSTM(device, vocabulary,
                                tokenization_parameters, training_parameters, model_parameters_LSTM,
                                train_loader, validate_loader, initial_test_loader,
                                epoch_metrics, model_final_metrics, models_tracker)
 
+                for model_parameters_CNN in CNN_PARAMETER_SPACE:
+                    train_CNN(device, vocabulary,
+                              tokenization_parameters, training_parameters, model_parameters_CNN,
+                              train_loader, validate_loader, initial_test_loader,
+                              epoch_metrics, model_final_metrics, models_tracker)
+
             del train_loader, validate_loader, initial_test_loader
             gc.collect()
             torch.cuda.empty_cache()
 
 
-    def build_parameter_space_BERT() -> ParameterSpace:
+    def build_parameter_space_BERT(try_combinations: bool) -> ParameterSpace:
         print("\nDefining the parameter space for BERT.")
 
-        BERT_PARAMETER_SPACE = ParameterSpace({
-            "num_worker_threads": [0],
-            "maximum_length": [128],
-            "batch_size": [128],        # 64 -> ~9 GiB VRAM | 128 -> ~16 GiB VRAM | 256 -> switches to CPU
-            "epochs": [3],
-            "learning_rate": [2e-5],
-        })
+        # Assignment requirements:
+        #  - Fine-tune the Transformer (document tokenizer, max length, LR, batch size, epochs, early stopping).
+
+        if try_combinations:
+            BERT_PARAMETER_SPACE = ParameterSpace({
+                "initial_model": ["bert-base-uncased"],
+                "tokenizer_name": ["bert-base-uncased"],
+                "num_worker_threads": [0],
+
+                "maximum_length": [64, 128],
+                "learning_rate": [2e-5, 5e-5],
+                "batch_size": [16, 128],
+                "epochs": [1, 3, 5],
+                "patience": [0],
+                "num_classes": [4],
+            })
+
+        else:
+            BERT_PARAMETER_SPACE = ParameterSpace({
+                "initial_model": ["bert-base-uncased"],
+                "tokenizer_name": ["bert-base-uncased"],
+                "num_worker_threads": [0],
+
+                "maximum_length": [128],
+                "learning_rate": [2e-5],
+                "batch_size": [16],
+                "epochs": [3],
+                "patience": [0],
+                "num_classes": [4],
+            })
 
         return BERT_PARAMETER_SPACE
 
 
-    def pipeline_finetune_pretrained_BERT(seed: int,
-                                          epoch_metrics: dict, model_final_metrics: dict, models_tracker: dict):
-        device: torch.device = get_device()
+    def pipeline_finetune_pretrained_BERT(seed: int, device: torch.device,
+                                          train_df, validate_df, initial_test_df, final_test_df,
+                                          mapping_120k, mapping_7k,
+                                          epoch_metrics: dict, model_final_metrics: dict, models_tracker: dict,
+                                          try_combinations: bool):
 
-        # Setting a reproducible PRNG state.
-        print(f"\nSeeding PRNGs: {seed}.")
+        # Setting a reproducible PRNG state, per pipeline (not just for data-splitting).
+        print(f"\nSeeding PRNGs for the BERT pipeline: {seed}.")
         set_seed(seed)
 
-        BERT_PARAMETER_SPACE: ParameterSpace = build_parameter_space_BERT()
-
-        (train_df,
-         validate_df,
-         initial_test_df,
-         final_test_df,
-         mapping_120k,
-         mapping_7k) = get_preprocessed_dataset(seed)
-
-        inverse_mapping_7k: dict[int, int] = {v: k for k, v in mapping_7k.items()}
+        BERT_PARAMETER_SPACE: ParameterSpace = build_parameter_space_BERT(try_combinations)
 
 
         for bert_parameters in BERT_PARAMETER_SPACE:
 
+            print(f"\n\tFine tuning with BERT parameters: {bert_parameters}")
+
             # Load model & tokenizer
-            model = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=4)
+            model = AutoModelForSequenceClassification.from_pretrained(bert_parameters["initial_model"],
+                                                                       num_labels = bert_parameters["num_classes"])
             model.to(device)
-            tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+            tokenizer = AutoTokenizer.from_pretrained(bert_parameters["tokenizer_name"])
 
-            # Tokenize
-            def tokenize_df(df):
-                enc = tokenizer(df["input"].tolist(),
-                                truncation=True,
-                                padding="max_length",
-                                max_length=bert_parameters["maximum_length"],
-                                return_tensors="pt")
-                labels = torch.tensor(df["output"].values)
-                return TensorDataset(enc["input_ids"], enc["attention_mask"], labels)
+            # Tokenize helper method
+            def tokenize_dataframe(dataframe):
+                encoding = tokenizer(dataframe["input"].tolist(),
+                                     truncation = True,
+                                     padding = "max_length",
+                                     max_length = bert_parameters["maximum_length"],
+                                     return_tensors = "pt")
+                labels = torch.tensor(dataframe["output"].values)
+                return TensorDataset(encoding["input_ids"], encoding["attention_mask"], labels)
 
-            train_dataset = tokenize_df(train_df)
-            test_dataset = tokenize_df(initial_test_df)
+            train_dataset = tokenize_dataframe(train_df)
+            validate_dataset = tokenize_dataframe(validate_df)
+            test_dataset = tokenize_dataframe(initial_test_df)
 
             # DataLoaders
             train_loader = DataLoader(train_dataset, batch_size=bert_parameters["batch_size"],
-                                      shuffle=True, pin_memory=True, num_workers=4)
-            test_loader = DataLoader(test_dataset, batch_size=bert_parameters["batch_size"],
-                                     shuffle=False, pin_memory=True, num_workers=2)
+                                      shuffle = True, pin_memory = True,
+                                      num_workers = bert_parameters["num_worker_threads"])
 
-            # Optimizer and scaler
-            optimizer = AdamW(model.parameters(), lr=bert_parameters["learning_rate"])
+            validate_loader = DataLoader(validate_dataset, batch_size = bert_parameters["batch_size"],
+                                         shuffle = False, pin_memory = True,
+                                         num_workers = bert_parameters["num_worker_threads"])
+
+            test_loader = DataLoader(test_dataset, batch_size = bert_parameters["batch_size"],
+                                     shuffle = False, pin_memory = True,
+                                     num_workers = bert_parameters["num_worker_threads"])
+
+            # Optimizer and mixed-precision scaler
+            optimizer = AdamW(model.parameters(), lr = bert_parameters["learning_rate"])
             scaler = torch.amp.GradScaler()
 
             # Training loop
+            best_val_f1 = 0.0
+            patience = bert_parameters["patience"]
+            wait = 0
+
             model.train()
             for epoch in range(bert_parameters["epochs"]):
-                loop = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+                loop = tqdm(train_loader, desc = f"Epoch {epoch+1}")
                 for input_ids, attention_mask, labels in loop:
-                    input_ids = input_ids.to(device, non_blocking=True)
-                    attention_mask = attention_mask.to(device, non_blocking=True)
-                    labels = labels.to(device, non_blocking=True)
+                    input_ids = input_ids.to(device, non_blocking = True)
+                    attention_mask = attention_mask.to(device, non_blocking = True)
+                    labels = labels.to(device, non_blocking = True)
 
                     optimizer.zero_grad()
-                    with torch.amp.autocast(device_type="cuda"):
-                        outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    with torch.amp.autocast(device_type = "cuda"):
+                        outputs = model(input_ids = input_ids,
+                                        attention_mask = attention_mask,
+                                        labels = labels)
                         loss = outputs.loss
 
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
 
-                    loop.set_postfix(loss=loss.item())
+                    loop.set_postfix(loss = loss.item())
 
-            # Evaluation
-            model.eval()
-            all_preds, all_labels = [], []
-            with torch.no_grad():
-                for input_ids, attention_mask, labels in tqdm(test_loader, desc="Evaluation"):
-                    input_ids = input_ids.to(device, non_blocking=True)
-                    attention_mask = attention_mask.to(device, non_blocking=True)
-                    labels = labels.to(device, non_blocking=True)
+                model.eval()
+                val_preds, val_labels = [], []
 
-                    with torch.amp.autocast(device_type="cuda"):
+                with torch.no_grad():
+                    for input_ids, attention_mask, labels in validate_loader:
+                        input_ids = input_ids.to(device)
+                        attention_mask = attention_mask.to(device)
+                        labels = labels.to(device)
+
                         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    preds = torch.argmax(outputs.logits, dim=1)
+                        preds = torch.argmax(outputs.logits, dim=1)
+
+                        val_preds.append(preds.cpu())
+                        val_labels.append(labels.cpu())
+
+                val_preds = torch.cat(val_preds).numpy()
+                val_labels = torch.cat(val_labels).numpy()
+                val_f1 = f1_score(val_labels, val_preds, average="macro")
+
+                if val_f1 > best_val_f1:
+                    best_val_f1 = val_f1
+                    wait = 0
+                    # save best model weights
+                    best_weights = {k: v.cpu() for k, v in deepcopy(model.state_dict()).items()}
+                else:
+                    wait += 1
+                    if wait >= patience:
+                        print(f"Early stopping at epoch {epoch+1}")
+                        break
+
+
+            # Evaluation on initial-test split
+            print("Evaluating BERT.")
+            model.load_state_dict(best_weights)
+            model.eval()
+
+            all_preds = []
+            all_labels = []
+
+            with torch.no_grad():
+                for input_ids, attention_mask, labels in tqdm(test_loader, desc = "Evaluation"):
+                    input_ids = input_ids.to(device, non_blocking = True)
+                    attention_mask = attention_mask.to(device, non_blocking = True)
+                    labels = labels.to(device, non_blocking = True)
+
+                    with torch.amp.autocast(device_type = "cuda"):
+                        outputs = model(input_ids = input_ids, attention_mask = attention_mask)
+                    preds = torch.argmax(outputs.logits, dim = 1)
 
                     all_preds.append(preds.cpu())
                     all_labels.append(labels.cpu())
@@ -613,25 +683,106 @@ if __name__ == "__main__":
             all_preds = torch.cat(all_preds).numpy()
             all_labels = torch.cat(all_labels).numpy()
 
-            # Evaluation
-            print("Evaluating BERT.")
-            model.eval()
-            all_preds = []
-            all_labels = []
+            # Metrics
+            print("Computing initial test metrics, for BERT.")
 
             acc = accuracy_score(all_labels, all_preds)
-            macro_f1 = f1_score(all_labels, all_preds, average="macro")
-            cm = confusion_matrix(all_labels, all_preds)
+            macro_f1 = f1_score(all_labels, all_preds, average = "macro")
+            macro_precision = precision_score(all_labels, all_preds, average = "macro")
+            macro_recall = recall_score(all_labels, all_preds, average = "macro")
+            confusion_matrix_metric = confusion_matrix(all_labels, all_preds)
 
-            print(f"Accuracy: {acc:.4f}")
-            print(f"Macro-F1: {macro_f1:.4f}")
-            print("Confusion Matrix:")
-            print(cm)
+            print(f"Accuracy: {acc:.4f}"
+                  f"\nMacro-Precision: {macro_precision:.4f}"
+                  f"\nMacro-Recall: {macro_recall:.4f}"
+                  f"\nMacro-F1: {macro_f1:.4f}"
+                  f"\nConfusion Matrix:\n{confusion_matrix_metric}")
 
-            return model
+
+            index_model = len(models_tracker["BERTTextClassifier"])
+
+            model_final_metrics.append({
+                "model": "BERTTextClassifier",
+                "identifier": index_model,
+
+                "test_accuracy": acc,
+                "test_precision": macro_precision,
+                "test_recall": macro_recall,
+                "test_f1": macro_f1,
+            })
+
+            # Save weights on CPU
+            best_weights = {k: v.cpu() for k, v in deepcopy(model.state_dict()).items()}
+
+            models_tracker["BERTTextClassifier"].append({
+                "f1_score": macro_f1,
+                "weights": best_weights,
+
+                "bert_parameters": bert_parameters
+            })
+
+            # Error analysis
+            final_test_dataset = tokenize_dataframe(final_test_df)
+
+            final_test_loader = DataLoader(final_test_dataset,
+                                          batch_size = bert_parameters["batch_size"],
+                                          shuffle = False,
+                                          pin_memory = True,
+                                          num_workers = bert_parameters["num_worker_threads"])
+
+            model.eval()
+
+            all_preds_final = []
+            all_labels_final = []
+            all_texts_final = final_test_df["input"].tolist()
+
+            with torch.no_grad():
+                for input_ids, attention_mask, labels in tqdm(final_test_loader, desc="Final Test Evaluation"):
+                    input_ids = input_ids.to(device, non_blocking=True)
+                    attention_mask = attention_mask.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True)
+
+                    with torch.amp.autocast(device_type="cuda"):
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+                    preds = torch.argmax(outputs.logits, dim=1)
+
+                    all_preds_final.append(preds.cpu())
+                    all_labels_final.append(labels.cpu())
+
+            all_preds_final = torch.cat(all_preds_final).numpy()
+            all_labels_final = torch.cat(all_labels_final).numpy()
+
+            # Collect misclassified indices
+            misclassified_indices = []
+            for i in range(len(all_preds_final)):
+                if all_preds_final[i] != all_labels_final[i]:
+                    misclassified_indices.append(i)
+
+            print(f"Total misclassified (final test): {len(misclassified_indices)}")
+
+            num_samples = min(20, len(misclassified_indices))
+            sampled_indices = random.sample(misclassified_indices, num_samples)
+
+            print("\nSampled FINAL test misclassifications:\n")
+
+            for idx in sampled_indices:
+                print("=" * 80)
+                print(f"TRUE: {all_labels_final[idx]} | PRED: {all_preds_final[idx]}")
+                print(f"TEXT: {all_texts_final[idx][:300]}")
 
 
-    def final_results(epoch_metrics: dict, model_final_metrics: dict, models_tracker: dict):
+            del model, optimizer, scaler, train_loader, test_loader
+            torch.cuda.empty_cache()
+            gc.collect()
+
+
+    def final_results(device: torch.device,
+                      epoch_metrics: dict, model_final_metrics: dict, models_tracker: dict,
+                      final_test_df: pd.DataFrame,
+                      num_maximum_error_samples: int,
+                      inverse_mapping_7k):
+
         # Now traverse all models, and run them against the ::final_test_df (7k samples).
         for tracked_model in models_tracker.keys():
             for index_specific_model in range(len(models_tracker[tracked_model])):
@@ -640,106 +791,213 @@ if __name__ == "__main__":
 
                 print(f"\nAnalysis for model {tracked_model}[{index_specific_model}].")
 
-                # TODO: CNN, LSTM vs BERT
-
-                model: nn.Module = load_best_model(specific_model, tracked_model, device)
-                tokenizer_rules = specific_model["tokenization_parameters"]["to_lower_and_regex_substitution_rules"]
-                padding_token = specific_model["tokenization_parameters"]["padding_token"]
-                unknown_token = specific_model["tokenization_parameters"]["unknown_token"]
-                vocabulary = specific_model["vocabulary"]
-                target_input_list_length = specific_model["tokenization_parameters"]["target_input_list_length"]
-                num_classes = specific_model["tokenization_parameters"]["num_classes"]
-
-
-                # Tuple format: (expected label, predicted label, associated input text).
-                errors: list[tuple[int, int, str]] = get_misclassified_examples(device = device,
-                                                                                model = model,
-                                                                                data = final_test_df,
-                                                                                maximum_error_samples = 20,
-                                                                                tokenizer_rules = tokenizer_rules,
-                                                                                padding_token = padding_token,
-                                                                                unknown_token = unknown_token,
-                                                                                vocabulary = vocabulary,
-                                                                                target_input_list_length = target_input_list_length
-                                                                                )
-                # Mapping labels according to inverse mapping.
-                errors = [(inverse_mapping_7k[error[0]], inverse_mapping_7k[error[1]], error[2]) for error in errors]
-
-                print(f"{tracked_model}[{index_specific_model}] errors:")
-                for error in errors:
-                    print(f"\t{error}")
+                if tracked_model in ["CNNTextClassifier", "LSTMTextClassifier"]:
+                    model: nn.Module = load_best_model(specific_model, tracked_model, device)
+                    tokenizer_rules = specific_model["tokenization_parameters"]["to_lower_and_regex_substitution_rules"]
+                    padding_token = specific_model["tokenization_parameters"]["padding_token"]
+                    unknown_token = specific_model["tokenization_parameters"]["unknown_token"]
+                    vocabulary = specific_model["vocabulary"]
+                    target_input_list_length = specific_model["tokenization_parameters"]["target_input_list_length"]
+                    num_classes = specific_model["tokenization_parameters"]["num_classes"]
 
 
-                confusion_matrix: torch.Tensor = get_confusion_matrix(device = device,
-                                                                      model = model,
-                                                                      data = final_test_df,
-                                                                      tokenizer_rules = tokenizer_rules,
-                                                                      padding_token = padding_token,
-                                                                      unknown_token = unknown_token,
-                                                                      vocabulary = vocabulary,
-                                                                      target_input_list_length = target_input_list_length,
-                                                                      num_classes = num_classes
-                                                                      )
+                    # Tuple format: (expected label, predicted label, associated input text).
+                    errors: list[tuple[int, int, str]] = get_misclassified_examples_CNN_LSTM(device = device,
+                                                                                             model = model,
+                                                                                             data = final_test_df,
+                                                                                             maximum_error_samples = num_maximum_error_samples,
+                                                                                             tokenizer_rules = tokenizer_rules,
+                                                                                             padding_token = padding_token,
+                                                                                             unknown_token = unknown_token,
+                                                                                             vocabulary = vocabulary,
+                                                                                             target_input_list_length = target_input_list_length
+                                                                                             )
+                    # Mapping labels according to inverse mapping.
+                    errors = [(inverse_mapping_7k[error[0]], inverse_mapping_7k[error[1]], error[2]) for error in errors]
 
-                # We need to return to the original labels, but the confusion matrix is computed as a `torch.Tensor`.
-                #  We turn the `torch.Tensor` into a `pd.DataFrame` and assign the original labels.
-
-                class_names: list[str] = [str(inverse_mapping_7k[i]) for i in range(num_classes)]
-
-                confusion_df: pd.DataFrame = pd.DataFrame(confusion_matrix.cpu().numpy(), 
-                                                          index = [f"True: {name}" for name in class_names], 
-                                                          columns=[f"Pred: {name}" for name in class_names])
-
-                print(f"\nConfusion matrix for model {tracked_model}[{index_specific_model}]:\n{confusion_df}")
+                    print(f"{tracked_model}[{index_specific_model}] errors:")
+                    for error in errors:
+                        print(f"\t{error}")
 
 
-                per_label_confusion: pd.DataFrame = compute_classification_metrics(confusion_matrix)
-                
-                print(f"\nPer-label confusion:\n{per_label_confusion}")
+                    confusion_matrix: torch.Tensor = get_confusion_matrix(device = device,
+                                                                          model = model,
+                                                                          data = final_test_df,
+                                                                          tokenizer_rules = tokenizer_rules,
+                                                                          padding_token = padding_token,
+                                                                          unknown_token = unknown_token,
+                                                                          vocabulary = vocabulary,
+                                                                          target_input_list_length = target_input_list_length,
+                                                                          num_classes = num_classes
+                                                                          )
+
+                    # We need to return to the original labels, but the confusion matrix is computed as a `torch.Tensor`.
+                    #  We turn the `torch.Tensor` into a `pd.DataFrame` and assign the original labels.
+
+                    class_names: list[str] = [str(inverse_mapping_7k[i]) for i in range(num_classes)]
+
+                    confusion_df: pd.DataFrame = pd.DataFrame(confusion_matrix.cpu().numpy(), 
+                                                              index = [f"True: {name}" for name in class_names], 
+                                                              columns=[f"Pred: {name}" for name in class_names])
+
+                    print(f"\nConfusion matrix for model {tracked_model}[{index_specific_model}]:\n{confusion_df}")
 
 
-                saved_at: str = plot_learning_curves(epoch_metrics,
-                                                     tracked_model,
-                                                     index_specific_model,
-                                                     key = "accuracy",
-                                                     output_dir = "plots")
+                    per_label_confusion: pd.DataFrame = compute_classification_metrics(confusion_matrix)
+                    
+                    print(f"\nPer-label confusion:\n{per_label_confusion}")
 
-                print(f"Saved rendered learning curve plot to file: {saved_at}.")
+
+                    saved_at: str = plot_learning_curves(epoch_metrics,
+                                                         tracked_model,
+                                                         index_specific_model,
+                                                         key = "accuracy",
+                                                         output_dir = "plots")
+
+                    print(f"Saved rendered learning curve plot to file: {saved_at}.")
+
+                elif tracked_model in ["BERTTextClassifier"]:
+                    model = load_best_model(specific_model, tracked_model, device)
+                    model.to(device)
+                    model.eval()
+
+                    tokenizer = AutoTokenizer.from_pretrained(specific_model["bert_parameters"]["tokenizer_name"])
+                    max_length = specific_model["bert_parameters"]["maximum_length"]
+                    num_classes = specific_model["bert_parameters"]["num_classes"]
+
+                    # Tokenize entire dataset once
+                    encoding = tokenizer(final_test_df["input"].tolist(),
+                                         truncation = True,
+                                         padding = "max_length",
+                                         max_length = max_length,
+                                         return_tensors = "pt")
+
+                    dataset = TensorDataset(encoding["input_ids"], encoding["attention_mask"],
+                                            torch.tensor(final_test_df["output"].values))
+
+                    loader = DataLoader(dataset, batch_size = 32, shuffle = False)
+
+                    all_preds = []
+                    all_labels = []
+                    errors = []
+
+                    with torch.no_grad():
+                        for batch_idx, (input_ids, attention_mask, labels) in enumerate(loader):
+                            input_ids = input_ids.to(device)
+                            attention_mask = attention_mask.to(device)
+                            labels = labels.to(device)
+
+                            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                            preds = torch.argmax(outputs.logits, dim=1)
+
+                            all_preds.append(preds.cpu())
+                            all_labels.append(labels.cpu())
+
+                            if len(errors) < num_maximum_error_samples:
+                                index_begin: int = batch_idx * loader.batch_size
+                                index_end: int = (batch_idx + 1) * loader.batch_size
+
+                                batch_texts = final_test_df["input"].iloc[index_begin : index_end].tolist()
+
+                                for t, p, text in zip(labels.cpu(), preds.cpu(), batch_texts):
+                                    if t.item() != p.item() and len(errors) < num_maximum_error_samples:
+                                        errors.append((inverse_mapping_7k[t.item()],
+                                                       inverse_mapping_7k[p.item()],
+                                                       text))
+
+                    all_preds = torch.cat(all_preds).numpy()
+                    all_labels = torch.cat(all_labels).numpy()
+
+                    print(f"{tracked_model}[{index_specific_model}] errors:")
+                    for error in errors:
+                        print(f"\t{error}")
+
 
         for entry in model_final_metrics:
             model_name = entry["model"]
             identifier = entry["identifier"]
             test_acc = entry["test_accuracy"]
-            test_prec = entry["test_precision"]
-            test_rec = entry["test_recall"]
             test_f1 = entry["test_f1"]
 
-            print(f"\nModel: {model_name} (instance {identifier})")
-            print(f"  Test Accuracy : {test_acc:.4f}")
-            print(f"  Test Precision: {test_prec:.4f}")
-            print(f"  Test Recall   : {test_rec:.4f}")
-            print(f"  Test F1-score : {test_f1:.4f}")
+            print(f"\nModel: {model_name}[{identifier}]")
+            print(f"\tAccuracy : {test_acc:.4f}")
+            print(f"\tF1 score : {test_f1:.4f}")
+
+
+    def subsample_training_data(train_df: pd.DataFrame, fraction: float, seed: int):
+        return train_df.sample(frac = fraction, random_state = seed).reset_index(drop = True)
 
 
     def main():
         REPRODUCIBILITY_PRNG_SEED: Final[int] = 0
+        NUM_MAXIMUM_ERROR_SAMPLES: Final[int] = 20
+
+        # Setting a reproducible PRNG state.
+        print(f"\nSeeding PRNGs: {REPRODUCIBILITY_PRNG_SEED}.")
+        set_seed(REPRODUCIBILITY_PRNG_SEED)
+
 
         (epoch_metrics,
          model_final_metrics,
          models_tracker) = build_models_tracker()
 
+        (train_df,
+         validate_df,
+         initial_test_df,
+         final_test_df,
+         mapping_120k,
+         mapping_7k) = get_preprocessed_dataset(REPRODUCIBILITY_PRNG_SEED)
 
-        # Although the two pipelines do not share the downloaded data directly,
-        #  get_preprocessed_dataset() actually caches based on the seed, so the
-        #  BERT pipeline will see the already processed splits that the LSTM+CNN
-        #  pipeline produced.
+        device: torch.device = get_device()
 
-        pipeline_train_best_LSTM_and_CNN(REPRODUCIBILITY_PRNG_SEED,
+
+        pipeline_train_best_LSTM_and_CNN(REPRODUCIBILITY_PRNG_SEED, device,
+                                         train_df, validate_df, initial_test_df, final_test_df,
+                                         mapping_120k, mapping_7k,
                                          epoch_metrics, model_final_metrics, models_tracker)
 
-        pipeline_finetune_pretrained_BERT(REPRODUCIBILITY_PRNG_SEED,
-                                          epoch_metrics, model_final_metrics, models_tracker)
+        pipeline_finetune_pretrained_BERT(REPRODUCIBILITY_PRNG_SEED, device,
+                                          train_df, validate_df, initial_test_df, final_test_df,
+                                          mapping_120k, mapping_7k,
+                                          epoch_metrics, model_final_metrics, models_tracker, True)
 
-        final_results(epoch_metrics, model_final_metrics, models_tracker)
+
+        # Further analyses:
+        # 1) Label-noise sensitivity
+        train_25_df = subsample_training_data(train_df, 0.25, REPRODUCIBILITY_PRNG_SEED)
+        train_50_df = subsample_training_data(train_df, 0.50, REPRODUCIBILITY_PRNG_SEED)
+        
+        pipeline_finetune_pretrained_BERT(REPRODUCIBILITY_PRNG_SEED, device,
+                                          train_25_df, validate_df, initial_test_df, final_test_df,
+                                          mapping_120k, mapping_7k,
+                                          epoch_metrics, model_final_metrics, models_tracker, False)
+
+        pipeline_finetune_pretrained_BERT(REPRODUCIBILITY_PRNG_SEED, device,
+                                          train_50_df, validate_df, initial_test_df, final_test_df,
+                                          mapping_120k, mapping_7k,
+                                          epoch_metrics, model_final_metrics, models_tracker, False)
+
+        
+        # 2) Input field stress test
+        train_title_df = train_df.copy()
+        validate_title_df = validate_df.copy()
+        initial_test_title_df = initial_test_df.copy()
+        final_test_title_df = final_test_df.copy()
+
+        train_title_df["input"] = train_title_df["title"]
+        validate_title_df["input"] = validate_title_df["title"]
+        initial_test_title_df["input"] = initial_test_title_df["title"]
+        final_test_title_df["input"] = final_test_title_df["title"]
+
+        pipeline_finetune_pretrained_BERT(REPRODUCIBILITY_PRNG_SEED, device,
+                                          train_title_df, validate_title_df, initial_test_title_df, final_test_title_df,
+                                          mapping_120k, mapping_7k,
+                                          epoch_metrics, model_final_metrics, models_tracker, False)
+
+        # Printing results
+        inverse_mapping_7k: dict[int, int] = {v: k for k, v in mapping_7k.items()}
+        final_results(device,
+                      epoch_metrics, model_final_metrics, models_tracker,
+                      final_test_df, NUM_MAXIMUM_ERROR_SAMPLES, inverse_mapping_7k)
 
     main()

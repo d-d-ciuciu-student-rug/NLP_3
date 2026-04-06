@@ -1,12 +1,16 @@
 #!/bin/bash
 
-# We ran a profiler to see what exactly gives the overly-large CPU-side bottleneck.
-#  It seems to be that the data-loading is too slow, but couldn't quite understand why.
-#  Or maybe there are too many CPU-GPU synchronizations, and more processing should be moved GPU-side.
-
 timestamp="$(date +%Y-%m-%d_%H-%M-%S)"
 
-   OMP_NUM_THREADS=8 \
-&& MKL_NUM_THREADS=8 \
-&& uv run python3 main.py
-#&& uv run python3 -m cProfile -s tottime main.py  > "${timestamp}_trace.txt"
+# Install `uv`
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install project dependencies
+uv init assignment_NLP
+uv add datasets matplotlib pandas scikit-learn torch tqdm "transformers>=5.5.0"
+
+# Run within virtual environment
+uv run python3 main.py
+
+# Profile execution to identify bottlenecks
+#uv run python3 -m cProfile -s tottime main.py  > "${timestamp}_trace.txt"
